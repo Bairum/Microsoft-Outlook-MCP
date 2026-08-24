@@ -20,6 +20,7 @@ the [Microsoft Graph API](https://learn.microsoft.com/graph/) using OAuth 2.0
 | Contacts | `list_contacts`, `get_contact`, `create_contact`, `update_contact`, `delete_contact` |
 | Folders | `list_mail_folders`, `create_mail_folder`, `rename_mail_folder`, `delete_mail_folder` |
 | Inbox rules | `list_message_rules`, `get_message_rule`, `create_message_rule`, `update_message_rule`, `delete_message_rule` |
+| Delta sync | `list_changes`, `get_ops_snapshot` |
 
 ## 1. Register an app in Azure AD (Entra ID)
 
@@ -240,6 +241,45 @@ By default, `OUTLOOK_ALLOW_WRITES=false`. In this mode:
 When `OUTLOOK_ALLOW_WRITES=true`, the tools marked with ❌ become available
 (except inbox rule writes, which remain disabled). Use this setting only when
 you need to send mail, delete resources, or create meetings with attendees.
+
+## Delta sync tools
+
+Two read-only tools provide incremental and one-shot mailbox monitoring:
+
+### `list_changes` — Incremental delta sync
+
+Returns only what changed since the last call. Tracks mail in Inbox, Action,
+Staging, and Drafts folders (if they exist), plus calendar events. Delta
+cursors are persisted securely in OS-native encrypted storage (same backend as
+the token cache). Payloads are compact summaries — no full bodies.
+
+- First call (or `reset=true`) returns a full sync and saves a cursor for next time.
+- Subsequent calls return only changes: new messages, updates, deletes.
+- If a named folder doesn't exist, it's skipped and reported in `skippedFolders`.
+
+Use this for incremental triage workflows: agents can check what's new without
+re-reading the entire mailbox.
+
+### `get_ops_snapshot` — One-shot operational snapshot
+
+Returns a point-in-time snapshot of recent activity in one call:
+
+- Last 48 hours of Inbox (compact summaries)
+- Leftover messages in Staging and Action folders (if they exist)
+- Unsent Drafts (recent)
+- Calendar today + tomorrow in a caller-supplied IANA timezone (default UTC;
+  document `America/New_York` as an example)
+- Zero-attendee calendar events are flagged with `hasNoAttendees: true`
+
+Payloads are compact. Does not download full bodies, send mail, move messages,
+or modify events. Use this for quick health checks or when you need a fresh
+operational view without iterating.
+
+**Security**: Delta cursors (the `@odata.deltaLink` URLs returned by Graph) are
+validated to ensure they point to `https://graph.microsoft.com` before being
+stored or used. Cursors are stored in OS-native encrypted storage (Windows DPAPI
+/ macOS Keychain / Linux libsecret) with no plaintext fallback, fail-closed
+like the token cache.
 
 ## Security notes
 
