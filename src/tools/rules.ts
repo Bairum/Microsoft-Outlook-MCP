@@ -1,6 +1,8 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { GraphClient } from "../graph.js";
+import { sanitizePathSegment } from "../graph.js";
+import type { Config } from "../config.js";
 import { ok, fail, type ToolResult } from "./util.js";
 
 const recipient = (addr: string) => ({ emailAddress: { address: addr } });
@@ -91,6 +93,7 @@ function summarizeRule(r: any) {
 export function registerRulesAndFolderTools(
   server: McpServer,
   graph: GraphClient,
+  config: Config,
 ): void {
   // -------------------------------------------------------------------------
   // Mail folder management (list lives in mail.ts as list_mail_folders).
@@ -116,7 +119,7 @@ export function registerRulesAndFolderTools(
     async ({ displayName, parentFolder }): Promise<ToolResult> => {
       try {
         const path = parentFolder
-          ? `/me/mailFolders/${parentFolder}/childFolders`
+          ? `/me/mailFolders/${sanitizePathSegment(parentFolder, "parentFolder")}/childFolders`
           : "/me/mailFolders";
         const f = await graph.request<any>({
           method: "POST",
@@ -144,7 +147,7 @@ export function registerRulesAndFolderTools(
       try {
         const f = await graph.request<any>({
           method: "PATCH",
-          path: `/me/mailFolders/${id}`,
+          path: `/me/mailFolders/${sanitizePathSegment(id, "folder id")}`,
           body: { displayName },
         });
         return ok({ id: f.id, name: f.displayName });
@@ -154,24 +157,27 @@ export function registerRulesAndFolderTools(
     },
   );
 
-  server.registerTool(
-    "delete_mail_folder",
-    {
-      title: "Delete mail folder",
-      description:
-        "Delete a mail folder and its contents. This is not easily " +
-        "recoverable — use with care.",
-      inputSchema: { id: z.string().describe("Folder id (not a well-known name).") },
-    },
-    async ({ id }): Promise<ToolResult> => {
-      try {
-        await graph.request({ method: "DELETE", path: `/me/mailFolders/${id}` });
-        return ok({ deleted: true, id });
-      } catch (e) {
-        return fail(e);
-      }
-    },
-  );
+  // delete_mail_folder is gated behind OUTLOOK_ALLOW_WRITES.
+  if (config.allowWrites) {
+    server.registerTool(
+      "delete_mail_folder",
+      {
+        title: "Delete mail folder",
+        description:
+          "Delete a mail folder and its contents. This is not easily " +
+          "recoverable — use with care. (Write-gated: requires OUTLOOK_ALLOW_WRITES=true)",
+        inputSchema: { id: z.string().describe("Folder id (not a well-known name).") },
+      },
+      async ({ id }): Promise<ToolResult> => {
+        try {
+          await graph.request({ method: "DELETE", path: `/me/mailFolders/${sanitizePathSegment(id, "folder id")}` });
+          return ok({ deleted: true, id });
+        } catch (e) {
+          return fail(e);
+        }
+      },
+    );
+  }
 
   // -------------------------------------------------------------------------
   // Inbox message rules. Requires MailboxSettings.ReadWrite.
@@ -206,7 +212,7 @@ export function registerRulesAndFolderTools(
     async ({ id }): Promise<ToolResult> => {
       try {
         const r = await graph.request<any>({
-          path: `/me/mailFolders/inbox/messageRules/${id}`,
+          path: `/me/mailFolders/inbox/messageRules/${sanitizePathSegment(id, "rule id")}`,
         });
         return ok(summarizeRule(r));
       } catch (e) {
@@ -215,114 +221,11 @@ export function registerRulesAndFolderTools(
     },
   );
 
-  server.registerTool(
-    "create_message_rule",
-    {
-      title: "Create inbox rule",
-      description:
-        "Create an inbox rule. Provide at least one condition and one action. " +
-        "Rules are evaluated in ascending `sequence` order.",
-      inputSchema: {
-        displayName: z.string(),
-        sequence: z
-          .number()
-          .int()
-          .min(1)
-          .default(1)
-          .describe("Evaluation order; lower runs first."),
-        isEnabled: z.boolean().default(true),
-        ...conditionFields,
-        ...actionFields,
-      },
-    },
-    async (args): Promise<ToolResult> => {
-      try {
-        const conditions = buildConditions(args);
-        const actions = buildActions(args);
-        if (Object.keys(conditions).length === 0) {
-          return fail("Provide at least one condition.");
-        }
-        if (Object.keys(actions).length === 0) {
-          return fail("Provide at least one action.");
-        }
-        const r = await graph.request<any>({
-          method: "POST",
-          path: "/me/mailFolders/inbox/messageRules",
-          body: {
-            displayName: args.displayName,
-            sequence: args.sequence,
-            isEnabled: args.isEnabled,
-            conditions,
-            actions,
-          },
-        });
-        return ok(summarizeRule(r));
-      } catch (e) {
-        return fail(e);
-      }
-    },
-  );
-
-  server.registerTool(
-    "update_message_rule",
-    {
-      title: "Update inbox rule",
-      description:
-        "Update an inbox rule. Passing any condition field replaces all " +
-        "conditions; passing any action field replaces all actions.",
-      inputSchema: {
-        id: z.string(),
-        displayName: z.string().optional(),
-        sequence: z.number().int().min(1).optional(),
-        isEnabled: z.boolean().optional(),
-        ...conditionFields,
-        ...actionFields,
-      },
-    },
-    async ({ id, ...args }): Promise<ToolResult> => {
-      try {
-        const body: Record<string, unknown> = {};
-        if (args.displayName !== undefined) body.displayName = args.displayName;
-        if (args.sequence !== undefined) body.sequence = args.sequence;
-        if (args.isEnabled !== undefined) body.isEnabled = args.isEnabled;
-
-        const conditions = buildConditions(args);
-        if (Object.keys(conditions).length > 0) body.conditions = conditions;
-        const actions = buildActions(args);
-        if (Object.keys(actions).length > 0) body.actions = actions;
-
-        if (Object.keys(body).length === 0) {
-          return fail("Provide at least one field to update.");
-        }
-        const r = await graph.request<any>({
-          method: "PATCH",
-          path: `/me/mailFolders/inbox/messageRules/${id}`,
-          body,
-        });
-        return ok(summarizeRule(r));
-      } catch (e) {
-        return fail(e);
-      }
-    },
-  );
-
-  server.registerTool(
-    "delete_message_rule",
-    {
-      title: "Delete inbox rule",
-      description: "Delete an inbox rule by id.",
-      inputSchema: { id: z.string() },
-    },
-    async ({ id }): Promise<ToolResult> => {
-      try {
-        await graph.request({
-          method: "DELETE",
-          path: `/me/mailFolders/inbox/messageRules/${id}`,
-        });
-        return ok({ deleted: true, id });
-      } catch (e) {
-        return fail(e);
-      }
-    },
-  );
+  // Inbox rule write operations are DISABLED in this hardened fork.
+  // Creating or updating rules with forwardTo is a durable mail-forwarding
+  // vector that is too dangerous for a local Graph proxy. List and get are
+  // still available for inspection.
+  //
+  // If you need to manage inbox rules, set OUTLOOK_ALLOW_WRITES=true and
+  // carefully review any rule actions before creating them.
 }

@@ -1,6 +1,8 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { GraphClient } from "../graph.js";
+import { sanitizePathSegment } from "../graph.js";
+import type { Config } from "../config.js";
 import { ok, fail, type ToolResult } from "./util.js";
 
 function summarizeContact(c: any) {
@@ -23,6 +25,7 @@ const CONTACT_SELECT =
 export function registerContactTools(
   server: McpServer,
   graph: GraphClient,
+  config: Config,
 ): void {
   server.registerTool(
     "list_contacts",
@@ -71,7 +74,7 @@ export function registerContactTools(
     },
     async ({ id }): Promise<ToolResult> => {
       try {
-        const c = await graph.request<any>({ path: `/me/contacts/${id}` });
+        const c = await graph.request<any>({ path: `/me/contacts/${sanitizePathSegment(id, "contact id")}` });
         return ok(summarizeContact(c));
       } catch (e) {
         return fail(e);
@@ -151,7 +154,7 @@ export function registerContactTools(
         }
         const c = await graph.request<any>({
           method: "PATCH",
-          path: `/me/contacts/${id}`,
+          path: `/me/contacts/${sanitizePathSegment(id, "contact id")}`,
           body,
         });
         return ok(summarizeContact(c));
@@ -161,20 +164,23 @@ export function registerContactTools(
     },
   );
 
-  server.registerTool(
-    "delete_contact",
-    {
-      title: "Delete contact",
-      description: "Delete a contact by id.",
-      inputSchema: { id: z.string() },
-    },
-    async ({ id }): Promise<ToolResult> => {
-      try {
-        await graph.request({ method: "DELETE", path: `/me/contacts/${id}` });
-        return ok({ deleted: true, id });
-      } catch (e) {
-        return fail(e);
-      }
-    },
-  );
+  // delete_contact is gated behind OUTLOOK_ALLOW_WRITES.
+  if (config.allowWrites) {
+    server.registerTool(
+      "delete_contact",
+      {
+        title: "Delete contact",
+        description: "Delete a contact by id. (Write-gated: requires OUTLOOK_ALLOW_WRITES=true)",
+        inputSchema: { id: z.string() },
+      },
+      async ({ id }): Promise<ToolResult> => {
+        try {
+          await graph.request({ method: "DELETE", path: `/me/contacts/${sanitizePathSegment(id, "contact id")}` });
+          return ok({ deleted: true, id });
+        } catch (e) {
+          return fail(e);
+        }
+      },
+    );
+  }
 }

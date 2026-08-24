@@ -3,15 +3,15 @@ import {
   LogLevel,
   type Configuration,
   type ICachePlugin,
-  type TokenCacheContext,
 } from "@azure/msal-node";
 import {
   PersistenceCreator,
   PersistenceCachePlugin,
   DataProtectionScope,
 } from "@azure/msal-node-extensions";
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
-import { dirname } from "node:path";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { Config } from "./config.js";
 
 /**
@@ -23,71 +23,66 @@ function log(msg: string): void {
 }
 
 /**
- * Preferred cache: OS-native encrypted storage via @azure/msal-node-extensions.
+ * Enforced cache: OS-native encrypted storage via @azure/msal-node-extensions.
  *   - Windows -> DPAPI (encrypted, tied to the current Windows user)
  *   - macOS   -> Keychain
  *   - Linux   -> libsecret / GNOME Keyring
- * The persistence is verified at startup; if the native backend can't be
- * loaded or validated we fall back to the plaintext file so sign-in still
- * works (just without encryption at rest).
+ * Fails closed if the native backend is unavailable. No plaintext fallback.
  */
 async function buildCachePlugin(config: Config): Promise<ICachePlugin> {
+  // Verification must not leave dummy files in the project root. Use a temp
+  // directory for the persistence verify test and clean it up after.
+  const testDir = mkdtempSync(join(tmpdir(), "mcp-outlook-verify-"));
+  const testCachePath = join(testDir, "test-verify.cache");
+
   try {
-    const persistence = await PersistenceCreator.createPersistence({
-      cachePath: config.tokenCachePath,
-      // Used by the Windows DPAPI backend.
+    const testPersistence = await PersistenceCreator.createPersistence({
+      cachePath: testCachePath,
       dataProtectionScope: DataProtectionScope.CurrentUser,
-      // Used by the macOS Keychain / Linux libsecret backends.
       serviceName: "microsoft-outlook-mcp",
       accountName: "token-cache",
-      // Do NOT silently store plaintext on Linux when libsecret is missing;
-      // let it throw so we hit the explicit fallback below (which logs).
       usePlaintextFileOnLinux: false,
     });
 
-    // Confirms the backend can actually read/write/encrypt before we rely on
-    // it. Throws or returns false when the native layer is unusable.
-    const okToUse = await persistence.verifyPersistence();
-    if (!okToUse) throw new Error("verifyPersistence() returned false");
+    const okToUse = await testPersistence.verifyPersistence();
+    if (!okToUse) {
+      throw new Error(
+        "verifyPersistence() returned false — OS-native encrypted storage is not available",
+      );
+    }
 
-    log("token cache: OS-native encrypted storage (msal-node-extensions)");
+    // Verification passed. Clean up test dir and create the real persistence.
+    rmSync(testDir, { recursive: true, force: true });
+
+    const persistence = await PersistenceCreator.createPersistence({
+      cachePath: config.tokenCachePath,
+      dataProtectionScope: DataProtectionScope.CurrentUser,
+      serviceName: "microsoft-outlook-mcp",
+      accountName: "token-cache",
+      usePlaintextFileOnLinux: false,
+    });
+
+    log("token cache: OS-native encrypted storage (msal-node-extensions) — verified");
     return new PersistenceCachePlugin(persistence);
   } catch (err) {
-    log(
-      `secure token storage unavailable (${(err as Error).message}); ` +
-        "falling back to a plaintext file with restricted permissions.",
+    rmSync(testDir, { recursive: true, force: true });
+    throw new Error(
+      `OS-native encrypted token storage is required but unavailable: ${(err as Error).message}. ` +
+        `This hardened fork refuses to fall back to plaintext. ` +
+        `See README troubleshooting for instructions to enable encrypted storage on your OS.`,
     );
-    return makePlaintextCachePlugin(config.tokenCachePath);
   }
-}
-
-/**
- * Fallback cache: a plaintext JSON file. Written with 0600 where the OS honors
- * POSIX modes. Treat this file as a live credential.
- */
-function makePlaintextCachePlugin(cachePath: string): ICachePlugin {
-  return {
-    async beforeCacheAccess(ctx: TokenCacheContext): Promise<void> {
-      if (existsSync(cachePath)) {
-        ctx.tokenCache.deserialize(readFileSync(cachePath, "utf8"));
-      }
-    },
-    async afterCacheAccess(ctx: TokenCacheContext): Promise<void> {
-      if (ctx.cacheHasChanged) {
-        mkdirSync(dirname(cachePath), { recursive: true });
-        writeFileSync(cachePath, ctx.tokenCache.serialize(), { mode: 0o600 });
-      }
-    },
-  };
 }
 
 export class AuthProvider {
   private readonly pca: PublicClientApplication;
   private readonly scopes: string[];
+  private readonly expectedUsername?: string;
 
-  private constructor(pca: PublicClientApplication, scopes: string[]) {
+  private constructor(pca: PublicClientApplication, scopes: string[], expectedUsername?: string) {
     this.pca = pca;
     this.scopes = scopes;
+    this.expectedUsername = expectedUsername;
   }
 
   /**
@@ -114,7 +109,11 @@ export class AuthProvider {
       },
     };
 
-    return new AuthProvider(new PublicClientApplication(msalConfig), config.scopes);
+    return new AuthProvider(
+      new PublicClientApplication(msalConfig),
+      config.scopes,
+      config.expectedUsername,
+    );
   }
 
   /**
@@ -123,15 +122,36 @@ export class AuthProvider {
    * no usable cached account. When `interactive` is false (the default for
    * request-time acquisition) a missing/expired session throws instead of
    * blocking on user input — that keeps tool calls from hanging.
+   * 
+   * Security: when expectedUsername is configured, only use an account that
+   * matches it. Never silently pick the first cached account.
    */
   async getAccessToken(interactive = false): Promise<string> {
     const cache = this.pca.getTokenCache();
     const accounts = await cache.getAllAccounts();
 
     if (accounts.length > 0) {
+      let targetAccount = accounts[0];
+
+      // If a specific username is expected, find the matching account.
+      if (this.expectedUsername) {
+        const normalized = this.expectedUsername.toLowerCase();
+        const match = accounts.find(
+          (acc) => acc.username?.toLowerCase() === normalized,
+        );
+        if (!match) {
+          const cached = accounts.map((a) => a.username).join(", ");
+          throw new Error(
+            `Expected account ${this.expectedUsername} is not in the token cache. ` +
+              `Cached accounts: ${cached}. Run \`npm run login\` as ${this.expectedUsername}.`,
+          );
+        }
+        targetAccount = match;
+      }
+
       try {
         const result = await this.pca.acquireTokenSilent({
-          account: accounts[0],
+          account: targetAccount,
           scopes: this.scopes,
         });
         if (result?.accessToken) return result.accessToken;
