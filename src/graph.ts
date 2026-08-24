@@ -22,7 +22,12 @@ export function sanitizePathSegment(segment: string, label = "id"): string {
 
 export interface GraphRequestOptions {
   method?: "GET" | "POST" | "PATCH" | "PUT" | "DELETE";
-  /** Path relative to the Graph v1.0 base, e.g. "/me/messages". */
+  /**
+   * Path relative to the Graph v1.0 base (e.g. "/me/messages"), or an absolute
+   * https://graph.microsoft.com URL (e.g. a deltaLink or nextLink). Absolute
+   * URLs must have origin https://graph.microsoft.com; any other origin is
+   * rejected to prevent token leakage.
+   */
   path: string;
   /** Query string params. */
   query?: Record<string, string | number | boolean | undefined>;
@@ -53,10 +58,36 @@ export class GraphClient {
   async request<T = unknown>(opts: GraphRequestOptions): Promise<T> {
     const token = await this.auth.getAccessToken();
 
-    const url = new URL(GRAPH_BASE + opts.path);
-    if (opts.query) {
-      for (const [k, v] of Object.entries(opts.query)) {
-        if (v !== undefined) url.searchParams.set(k, String(v));
+    let url: URL;
+    
+    // If path is an absolute URL (e.g. a deltaLink or nextLink), validate its
+    // origin and use it directly. Never concatenate GRAPH_BASE onto an absolute URL.
+    if (opts.path.startsWith("https://")) {
+      try {
+        url = new URL(opts.path);
+      } catch {
+        throw new GraphError("Invalid absolute URL in path", 400, { path: opts.path });
+      }
+      
+      // Security: only allow https://graph.microsoft.com. Never send the Bearer
+      // token to any other origin.
+      if (url.origin !== "https://graph.microsoft.com") {
+        throw new GraphError(
+          `Absolute path URL origin must be https://graph.microsoft.com, got ${url.origin}`,
+          400,
+          { path: opts.path }
+        );
+      }
+      
+      // For absolute URLs, ignore opts.query (the URL already has query params).
+    } else {
+      // Relative path: concatenate with GRAPH_BASE.
+      url = new URL(GRAPH_BASE + opts.path);
+      
+      if (opts.query) {
+        for (const [k, v] of Object.entries(opts.query)) {
+          if (v !== undefined) url.searchParams.set(k, String(v));
+        }
       }
     }
 

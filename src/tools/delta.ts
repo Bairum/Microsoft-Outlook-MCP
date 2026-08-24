@@ -1,6 +1,7 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { GraphClient } from "../graph.js";
+import { sanitizePathSegment } from "../graph.js";
 import type { Config } from "../config.js";
 import type { DeltaStore } from "../deltaStore.js";
 import { ok, fail, type ToolResult } from "./util.js";
@@ -94,7 +95,8 @@ async function fetchMailFolderDelta(
 
   // If we have a deltaLink, use it to get changes since last sync.
   // Otherwise, do a full sync starting from the folder's messages endpoint.
-  let url = deltaLink ?? `/me/mailFolders/${folderId}/messages/delta`;
+  // Security: sanitize folder ID to prevent path traversal.
+  const path = deltaLink ?? `/me/mailFolders/${sanitizePathSegment(folderId, "folder id")}/messages/delta`;
   const query = deltaLink
     ? undefined
     : {
@@ -102,28 +104,20 @@ async function fetchMailFolderDelta(
           "id,subject,from,receivedDateTime,isRead,isDraft,parentFolderId,bodyPreview",
       };
 
-  // Fetch the first page.
+  // Fetch the first page. GraphClient.request now handles absolute URLs (deltaLink)
+  // and validates their origin.
   let page = await graph.request<{ value: any[]; "@odata.deltaLink"?: string; "@odata.nextLink"?: string }>({
-    path: url,
+    path,
     query,
   });
 
   if (page.value) messages.push(...page.value.map(summarizeMessage));
 
   // Follow nextLink pagination until we reach the deltaLink.
+  // GraphClient.request handles absolute nextLink URLs and validates origin.
   while (page["@odata.nextLink"]) {
-    const nextLink = page["@odata.nextLink"];
-
-    // Security: validate nextLink origin.
-    const nextUrl = new URL(nextLink);
-    if (nextUrl.origin !== "https://graph.microsoft.com") {
-      throw new Error(
-        `@odata.nextLink origin must be https://graph.microsoft.com, got ${nextUrl.origin}`
-      );
-    }
-
     page = await graph.request<{ value: any[]; "@odata.deltaLink"?: string; "@odata.nextLink"?: string }>({
-      path: nextLink,
+      path: page["@odata.nextLink"],
     });
 
     if (page.value) messages.push(...page.value.map(summarizeMessage));
@@ -145,7 +139,10 @@ async function fetchCalendarDelta(
 ): Promise<{ events: CompactEvent[]; nextDeltaLink: string }> {
   const events: CompactEvent[] = [];
 
-  let url = deltaLink ?? "/me/calendarView/delta";
+  // If we have a deltaLink, use it. Otherwise, start with a full sync covering
+  // past 7 days and next 30 days. startDateTime/endDateTime are only for the
+  // first relative call; subsequent deltaLink calls already have them baked in.
+  const path = deltaLink ?? "/me/calendarView/delta";
   const query = deltaLink
     ? undefined
     : {
@@ -154,25 +151,18 @@ async function fetchCalendarDelta(
         $select: "id,subject,organizer,start,isAllDay,attendees",
       };
 
+  // GraphClient.request now handles absolute URLs (deltaLink) and validates origin.
   let page = await graph.request<{ value: any[]; "@odata.deltaLink"?: string; "@odata.nextLink"?: string }>({
-    path: url,
+    path,
     query,
   });
 
   if (page.value) events.push(...page.value.map(summarizeEvent));
 
+  // Follow nextLink pagination. GraphClient.request validates origin.
   while (page["@odata.nextLink"]) {
-    const nextLink = page["@odata.nextLink"];
-
-    const nextUrl = new URL(nextLink);
-    if (nextUrl.origin !== "https://graph.microsoft.com") {
-      throw new Error(
-        `@odata.nextLink origin must be https://graph.microsoft.com, got ${nextUrl.origin}`
-      );
-    }
-
     page = await graph.request<{ value: any[]; "@odata.deltaLink"?: string; "@odata.nextLink"?: string }>({
-      path: nextLink,
+      path: page["@odata.nextLink"],
     });
 
     if (page.value) events.push(...page.value.map(summarizeEvent));
@@ -307,7 +297,7 @@ export function registerDeltaTools(
         const inboxId = await findFolderByName(graph, "Inbox");
         if (inboxId) {
           const inboxData = await graph.request<{ value: any[] }>({
-            path: `/me/mailFolders/${inboxId}/messages`,
+            path: `/me/mailFolders/${sanitizePathSegment(inboxId, "inbox folder id")}/messages`,
             query: {
               $filter: `receivedDateTime ge ${fortyEightHoursAgo.toISOString()}`,
               $select:
@@ -325,7 +315,7 @@ export function registerDeltaTools(
         const stagingId = await findFolderByName(graph, "Staging");
         if (stagingId) {
           const stagingData = await graph.request<{ value: any[] }>({
-            path: `/me/mailFolders/${stagingId}/messages`,
+            path: `/me/mailFolders/${sanitizePathSegment(stagingId, "staging folder id")}/messages`,
             query: {
               $select:
                 "id,subject,from,receivedDateTime,isRead,isDraft,parentFolderId,bodyPreview",
@@ -342,7 +332,7 @@ export function registerDeltaTools(
         const actionId = await findFolderByName(graph, "Action");
         if (actionId) {
           const actionData = await graph.request<{ value: any[] }>({
-            path: `/me/mailFolders/${actionId}/messages`,
+            path: `/me/mailFolders/${sanitizePathSegment(actionId, "action folder id")}/messages`,
             query: {
               $select:
                 "id,subject,from,receivedDateTime,isRead,isDraft,parentFolderId,bodyPreview",
@@ -359,7 +349,7 @@ export function registerDeltaTools(
         const draftsId = await findFolderByName(graph, "Drafts");
         if (draftsId) {
           const draftsData = await graph.request<{ value: any[] }>({
-            path: `/me/mailFolders/${draftsId}/messages`,
+            path: `/me/mailFolders/${sanitizePathSegment(draftsId, "drafts folder id")}/messages`,
             query: {
               $filter: "isDraft eq true",
               $select:
@@ -374,15 +364,32 @@ export function registerDeltaTools(
         }
 
         // Calendar: today + tomorrow in the specified timezone.
-        const todayStart = new Date(now.toLocaleDateString("en-US", { timeZone: timezone }));
-        const tomorrowEnd = new Date(todayStart);
-        tomorrowEnd.setDate(tomorrowEnd.getDate() + 2);
+        // Construct date boundaries reliably without relying on Date parsing.
+        // Get current date parts in the target timezone.
+        const dateFormatter = new Intl.DateTimeFormat("en-US", {
+          timeZone: timezone,
+          year: "numeric",
+          month: "2-digit",
+          day: "2-digit",
+        });
+        const parts = dateFormatter.formatToParts(now);
+        const year = parts.find((p) => p.type === "year")!.value;
+        const month = parts.find((p) => p.type === "month")!.value;
+        const day = parts.find((p) => p.type === "day")!.value;
+
+        // Today start at 00:00 in the target timezone.
+        const todayStart = `${year}-${month}-${day}T00:00:00`;
+        
+        // Tomorrow end at 23:59:59 (2 days from today start).
+        const todayDate = new Date(`${year}-${month}-${day}T00:00:00Z`);
+        todayDate.setUTCDate(todayDate.getUTCDate() + 2);
+        const tomorrowEnd = todayDate.toISOString().split("T")[0] + "T23:59:59";
 
         const calendarData = await graph.request<{ value: any[] }>({
           path: "/me/calendarView",
           query: {
-            startDateTime: todayStart.toISOString(),
-            endDateTime: tomorrowEnd.toISOString(),
+            startDateTime: todayStart,
+            endDateTime: tomorrowEnd,
             $select: "id,subject,organizer,start,isAllDay,attendees",
             $orderby: "start/dateTime",
             $top: 100,
