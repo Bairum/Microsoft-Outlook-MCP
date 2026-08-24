@@ -130,24 +130,122 @@ Restart the client. Ask Claude to run `auth_status` or `whoami` to confirm.
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `OUTLOOK_CLIENT_ID` | *(required)* | Azure AD application (client) ID |
-| `OUTLOOK_TENANT_ID` | `common` | Tenant GUID or `common`/`organizations`/`consumers` |
-| `OUTLOOK_SCOPES` | Mail/Calendar/Contacts set | Space-separated delegated Graph scopes |
-| `OUTLOOK_TOKEN_CACHE_PATH` | `.token-cache.json` | Where the token cache is stored |
+| `OUTLOOK_TENANT_ID` | *(required)* | **Tenant GUID** (e.g. `12345678-1234-1234-1234-123456789abc`). This hardened fork **requires** a real tenant GUID and rejects `common`, `organizations`, or `consumers`. |
+| `OUTLOOK_SCOPES` | `User.Read Mail.ReadWrite Mail.Send Calendars.ReadWrite Contacts.ReadWrite MailboxSettings.ReadWrite` | Space-separated delegated Graph scopes. **Scopes are allowlisted in code**. Any scope not on the allowlist will cause startup to fail. Do not request `*.Shared`, `Directory.*`, `Sites.*`, or `Files.*` scopes. |
+| `OUTLOOK_TOKEN_CACHE_PATH` | `.token-cache.json` | Where the token cache is stored. **OS-native encrypted storage is required** (Windows DPAPI / macOS Keychain / Linux libsecret). This fork refuses to fall back to plaintext. |
+| `OUTLOOK_EXPECTED_USERNAME` | *(recommended)* `your work UPN` | The UPN of the expected signed-in user. When set, silent token acquisition will fail if a different account is cached. **Strongly recommended for work-tenant forks to prevent accidental use of the wrong cached account.** |
+| `OUTLOOK_ALLOW_WRITES` | `false` | **Write gate**. When `false` (default), dangerous write operations are disabled or restricted. See "Write gates" below. Set to `true` only when you need to send mail, delete resources, or create events with attendees. |
+
+## Security hardening (this fork)
+
+This is a **hardened fork** of the original `taddiemason/Microsoft-Outlook-MCP`
+designed to be safer when run as a local Graph proxy for a single work user:
+**your work UPN**.
+
+Key changes:
+
+1. **Graph pagination origin check**: `@odata.nextLink` URLs are validated to
+   ensure they point to `https://graph.microsoft.com` before the Bearer token
+   is sent. Prevents token leakage to malicious redirect hosts.
+
+2. **Path sanitization**: Message IDs, folder IDs, contact IDs, event IDs, and
+   folder display names are validated and encoded. Rejects `/` and `..` to
+   prevent path traversal attacks that could escape `/me/` scope.
+
+3. **Scope allowlist**: Graph scopes are hard-coded in `src/config.ts`. The
+   allowed set is:
+   - `User.Read`
+   - `Mail.ReadWrite`
+   - `Mail.Send`
+   - `Calendars.ReadWrite`
+   - `Contacts.ReadWrite`
+   - `MailboxSettings.ReadWrite`
+   - `offline_access` (added automatically by MSAL)
+
+   Any scope not on this list (especially `*.Shared`, `Directory.*`, `Sites.*`,
+   or `Files.*`) causes startup to fail. Do not request extra scopes in
+   `OUTLOOK_SCOPES`.
+
+4. **Encrypted token cache enforced**: OS-native encrypted storage (Windows
+   DPAPI / macOS Keychain / Linux libsecret) is **required**. If the native
+   backend is unavailable, startup fails. No plaintext fallback. See
+   troubleshooting for how to enable encrypted storage on your OS.
+
+5. **Tenant GUID required**: `OUTLOOK_TENANT_ID` must be set to your
+   organization's tenant GUID. This fork rejects `common`, `organizations`, and
+   `consumers` to prevent sign-in with the wrong account type.
+
+6. **Account binding**: Set `OUTLOOK_EXPECTED_USERNAME` (e.g.
+   `your work UPN`) to bind silent token acquisition to a specific
+   UPN. The server refuses to use cached accounts that don't match. Prevents
+   accidentally picking the wrong cached account (e.g. a personal account when
+   you meant to use a work account).
+
+7. **Write gates**: Dangerous write operations are gated behind
+   `OUTLOOK_ALLOW_WRITES=true` (default: `false`). When writes are disabled:
+   - Inbox rule write operations (`create_message_rule`, `update_message_rule`,
+     `delete_message_rule`) are **completely removed** to prevent durable
+     mail-forwarding rules with `forwardTo`.
+   - `send_mail` and `reply_to_message` are not registered (sending disabled).
+   - `delete_message` with `permanent=true` returns an error (soft delete to
+     trash is still allowed).
+   - `create_event` with attendees returns an error (creating events without
+     attendees is still allowed).
+   - `delete_event`, `delete_contact`, and `delete_mail_folder` are not
+     registered.
+
+   Set `OUTLOOK_ALLOW_WRITES=true` only when you need these operations. Read,
+   list, get, mark read/unread, move messages, and update flags remain
+   available.
+
+## Write gates
+
+By default, `OUTLOOK_ALLOW_WRITES=false`. In this mode:
+
+| Tool | Availability |
+| --- | --- |
+| **Mail** | |
+| `list_messages`, `get_message` | ✅ Available |
+| `update_message` (read/flag) | ✅ Available |
+| `move_message` | ✅ Available |
+| `delete_message` (soft) | ✅ Available (moves to trash) |
+| `delete_message` (permanent) | ❌ Requires `OUTLOOK_ALLOW_WRITES=true` |
+| `send_mail` | ❌ Not registered |
+| `reply_to_message` | ❌ Not registered |
+| **Calendar** | |
+| `list_events`, `get_event` | ✅ Available |
+| `create_event` (no attendees) | ✅ Available |
+| `create_event` (with attendees) | ❌ Requires `OUTLOOK_ALLOW_WRITES=true` |
+| `update_event` | ✅ Available |
+| `respond_to_event` | ✅ Available |
+| `delete_event` | ❌ Not registered |
+| **Contacts** | |
+| `list_contacts`, `get_contact` | ✅ Available |
+| `create_contact`, `update_contact` | ✅ Available |
+| `delete_contact` | ❌ Not registered |
+| **Folders** | |
+| `list_mail_folders` | ✅ Available |
+| `create_mail_folder`, `rename_mail_folder` | ✅ Available |
+| `delete_mail_folder` | ❌ Not registered |
+| **Inbox rules** | |
+| `list_message_rules`, `get_message_rule` | ✅ Available |
+| `create_message_rule`, `update_message_rule`, `delete_message_rule` | ❌ Completely disabled (not registered even with `OUTLOOK_ALLOW_WRITES=true` — too dangerous for a local proxy) |
+
+When `OUTLOOK_ALLOW_WRITES=true`, the tools marked with ❌ become available
+(except inbox rule writes, which remain disabled). Use this setting only when
+you need to send mail, delete resources, or create meetings with attendees.
 
 ## Security notes
 
-- The token cache holds live refresh/access tokens. By default it is
-  **encrypted at rest** using your OS credential store (Windows DPAPI / macOS
-  Keychain / Linux libsecret), tied to your user account. Only if that native
-  backend is unavailable does it fall back to a git-ignored plaintext file
-  written with `0600` permissions — watch the startup log to see which is in
-  use. Either way, run `npm run login -- --logout` to revoke local access.
+- The token cache holds live refresh/access tokens. **OS-native encrypted
+  storage is required** in this fork (Windows DPAPI / macOS Keychain / Linux
+  libsecret). If the native backend is unavailable, the server refuses to
+  start. See troubleshooting below for setup instructions.
 - **Client ID and tenant ID are not secrets** — this is a **public client**
   app, so no client secret is stored anywhere.
 - Scopes are delegated: the server can only do what your signed-in account can.
-- If you upgraded from an earlier version that used a plaintext
-  `.token-cache.json`, delete that file and re-run `npm run login` so the cache
-  is rewritten in the encrypted format.
+- Run `npm run login -- --logout` to clear the token cache and revoke local
+  access.
 
 ## Troubleshooting
 

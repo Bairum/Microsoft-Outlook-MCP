@@ -2,6 +2,24 @@ import type { AuthProvider } from "./auth.js";
 
 const GRAPH_BASE = "https://graph.microsoft.com/v1.0";
 
+/**
+ * Sanitize a Graph API path segment (message ID, folder ID, contact ID, event
+ * ID, or folder display name). Rejects `/` and `..` to prevent path traversal.
+ * Encodes the segment so interpolation into a path is safe.
+ */
+export function sanitizePathSegment(segment: string, label = "id"): string {
+  if (!segment || typeof segment !== "string") {
+    throw new Error(`${label} must be a non-empty string`);
+  }
+  if (segment.includes("/") || segment.includes("..")) {
+    throw new Error(
+      `${label} contains forbidden path characters (/ or ..) that could ` +
+        `escape /me/ scope: ${segment}`,
+    );
+  }
+  return encodeURIComponent(segment);
+}
+
 export interface GraphRequestOptions {
   method?: "GET" | "POST" | "PATCH" | "PUT" | "DELETE";
   /** Path relative to the Graph v1.0 base, e.g. "/me/messages". */
@@ -89,8 +107,30 @@ export class GraphClient {
 
     let count = 1;
     while (page["@odata.nextLink"] && count < maxPages) {
+      const nextLink = page["@odata.nextLink"];
+      
+      // Security: only follow nextLink URLs that point to the official Graph API
+      // host. Never send the Bearer token to any other origin.
+      let nextUrl: URL;
+      try {
+        nextUrl = new URL(nextLink);
+      } catch {
+        throw new GraphError(
+          "Invalid @odata.nextLink URL",
+          400,
+          { nextLink },
+        );
+      }
+      if (nextUrl.origin !== "https://graph.microsoft.com") {
+        throw new GraphError(
+          `@odata.nextLink origin must be https://graph.microsoft.com, got ${nextUrl.origin}`,
+          400,
+          { nextLink },
+        );
+      }
+
       const token = await this.auth.getAccessToken();
-      const res = await fetch(page["@odata.nextLink"], {
+      const res = await fetch(nextLink, {
         headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
       });
       const text = await res.text();

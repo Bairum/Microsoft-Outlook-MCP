@@ -1,6 +1,8 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { GraphClient } from "../graph.js";
+import { sanitizePathSegment } from "../graph.js";
+import type { Config } from "../config.js";
 import { ok, fail, type ToolResult } from "./util.js";
 
 const recipient = (addr: string) => ({ emailAddress: { address: addr } });
@@ -34,7 +36,7 @@ function summarizeMessage(m: MessageLite) {
 const SELECT =
   "id,subject,from,toRecipients,receivedDateTime,isRead,hasAttachments,bodyPreview,webLink";
 
-export function registerMailTools(server: McpServer, graph: GraphClient): void {
+export function registerMailTools(server: McpServer, graph: GraphClient, config: Config): void {
   server.registerTool(
     "list_messages",
     {
@@ -64,7 +66,7 @@ export function registerMailTools(server: McpServer, graph: GraphClient): void {
     },
     async ({ folder, top, search, filter, unreadOnly }): Promise<ToolResult> => {
       try {
-        const seg = folder ? `/me/mailFolders/${folder}/messages` : "/me/messages";
+        const seg = folder ? `/me/mailFolders/${sanitizePathSegment(folder, "folder")}/messages` : "/me/messages";
         const query: Record<string, string | number> = {
           $top: top,
           $select: SELECT,
@@ -111,7 +113,7 @@ export function registerMailTools(server: McpServer, graph: GraphClient): void {
     async ({ id, bodyType }): Promise<ToolResult> => {
       try {
         const data = await graph.request<any>({
-          path: `/me/messages/${id}`,
+          path: `/me/messages/${sanitizePathSegment(id, "message id")}`,
           headers: { Prefer: `outlook.body-content-type="${bodyType}"` },
         });
         return ok({
@@ -134,69 +136,72 @@ export function registerMailTools(server: McpServer, graph: GraphClient): void {
     },
   );
 
-  server.registerTool(
-    "send_mail",
-    {
-      title: "Send mail",
-      description: "Compose and send a new email immediately.",
-      inputSchema: {
-        to: z.array(z.string()).min(1).describe("Recipient email addresses."),
-        subject: z.string(),
-        body: z.string(),
-        bodyType: z.enum(["text", "html"]).default("text"),
-        cc: z.array(z.string()).optional(),
-        bcc: z.array(z.string()).optional(),
-        saveToSentItems: z.boolean().default(true),
+  // send_mail and reply_to_message are gated behind OUTLOOK_ALLOW_WRITES.
+  if (config.allowWrites) {
+    server.registerTool(
+      "send_mail",
+      {
+        title: "Send mail",
+        description: "Compose and send a new email immediately. (Write-gated: requires OUTLOOK_ALLOW_WRITES=true)",
+        inputSchema: {
+          to: z.array(z.string()).min(1).describe("Recipient email addresses."),
+          subject: z.string(),
+          body: z.string(),
+          bodyType: z.enum(["text", "html"]).default("text"),
+          cc: z.array(z.string()).optional(),
+          bcc: z.array(z.string()).optional(),
+          saveToSentItems: z.boolean().default(true),
+        },
       },
-    },
-    async ({ to, subject, body, bodyType, cc, bcc, saveToSentItems }): Promise<ToolResult> => {
-      try {
-        await graph.request({
-          method: "POST",
-          path: "/me/sendMail",
-          body: {
-            message: {
-              subject,
-              body: { contentType: bodyType, content: body },
-              toRecipients: to.map(recipient),
-              ccRecipients: (cc ?? []).map(recipient),
-              bccRecipients: (bcc ?? []).map(recipient),
+      async ({ to, subject, body, bodyType, cc, bcc, saveToSentItems }): Promise<ToolResult> => {
+        try {
+          await graph.request({
+            method: "POST",
+            path: "/me/sendMail",
+            body: {
+              message: {
+                subject,
+                body: { contentType: bodyType, content: body },
+                toRecipients: to.map(recipient),
+                ccRecipients: (cc ?? []).map(recipient),
+                bccRecipients: (bcc ?? []).map(recipient),
+              },
+              saveToSentItems,
             },
-            saveToSentItems,
-          },
-        });
-        return ok({ sent: true, to, subject });
-      } catch (e) {
-        return fail(e);
-      }
-    },
-  );
-
-  server.registerTool(
-    "reply_to_message",
-    {
-      title: "Reply to message",
-      description:
-        "Reply to an existing message. Use replyAll to include everyone.",
-      inputSchema: {
-        id: z.string(),
-        comment: z.string().describe("The reply text."),
-        replyAll: z.boolean().default(false),
+          });
+          return ok({ sent: true, to, subject });
+        } catch (e) {
+          return fail(e);
+        }
       },
-    },
-    async ({ id, comment, replyAll }): Promise<ToolResult> => {
-      try {
-        await graph.request({
-          method: "POST",
-          path: `/me/messages/${id}/${replyAll ? "replyAll" : "reply"}`,
-          body: { comment },
-        });
-        return ok({ replied: true, id, replyAll });
-      } catch (e) {
-        return fail(e);
-      }
-    },
-  );
+    );
+
+    server.registerTool(
+      "reply_to_message",
+      {
+        title: "Reply to message",
+        description:
+          "Reply to an existing message. Use replyAll to include everyone. (Write-gated: requires OUTLOOK_ALLOW_WRITES=true)",
+        inputSchema: {
+          id: z.string(),
+          comment: z.string().describe("The reply text."),
+          replyAll: z.boolean().default(false),
+        },
+      },
+      async ({ id, comment, replyAll }): Promise<ToolResult> => {
+        try {
+          await graph.request({
+            method: "POST",
+            path: `/me/messages/${sanitizePathSegment(id, "message id")}/${replyAll ? "replyAll" : "reply"}`,
+            body: { comment },
+          });
+          return ok({ replied: true, id, replyAll });
+        } catch (e) {
+          return fail(e);
+        }
+      },
+    );
+  }
 
   server.registerTool(
     "update_message",
@@ -219,7 +224,7 @@ export function registerMailTools(server: McpServer, graph: GraphClient): void {
         }
         const data = await graph.request<any>({
           method: "PATCH",
-          path: `/me/messages/${id}`,
+          path: `/me/messages/${sanitizePathSegment(id, "message id")}`,
           body,
         });
         return ok({ id: data.id, isRead: data.isRead, flag: data.flag });
@@ -248,7 +253,7 @@ export function registerMailTools(server: McpServer, graph: GraphClient): void {
       try {
         const data = await graph.request<any>({
           method: "POST",
-          path: `/me/messages/${id}/move`,
+          path: `/me/messages/${sanitizePathSegment(id, "message id")}/move`,
           body: { destinationId: destinationFolder },
         });
         return ok({ moved: true, newId: data.id, parentFolderId: data.parentFolderId });
@@ -258,28 +263,39 @@ export function registerMailTools(server: McpServer, graph: GraphClient): void {
     },
   );
 
+  // delete_message with permanent=true is gated behind OUTLOOK_ALLOW_WRITES.
+  // Soft delete (move to trash) is always allowed.
   server.registerTool(
     "delete_message",
     {
       title: "Delete message",
       description:
-        "Delete a message. By default moves it to Deleted Items (recoverable).",
+        "Delete a message. By default moves it to Deleted Items (recoverable). " +
+        "Permanent deletion requires OUTLOOK_ALLOW_WRITES=true.",
       inputSchema: {
         id: z.string(),
         permanent: z
           .boolean()
           .default(false)
-          .describe("If true, permanently delete instead of moving to trash."),
+          .describe("If true, permanently delete instead of moving to trash (requires OUTLOOK_ALLOW_WRITES=true)."),
       },
     },
     async ({ id, permanent }): Promise<ToolResult> => {
       try {
+        const safeId = sanitizePathSegment(id, "message id");
         if (permanent) {
-          await graph.request({ method: "DELETE", path: `/me/messages/${id}` });
+          if (!config.allowWrites) {
+            return fail(
+              "Permanent message deletion requires OUTLOOK_ALLOW_WRITES=true. " +
+              "Set this environment variable to enable dangerous writes, or use " +
+              "permanent=false to move to trash instead.",
+            );
+          }
+          await graph.request({ method: "DELETE", path: `/me/messages/${safeId}` });
         } else {
           await graph.request({
             method: "POST",
-            path: `/me/messages/${id}/move`,
+            path: `/me/messages/${safeId}/move`,
             body: { destinationId: "deleteditems" },
           });
         }

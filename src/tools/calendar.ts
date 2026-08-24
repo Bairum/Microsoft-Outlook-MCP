@@ -1,6 +1,8 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { GraphClient } from "../graph.js";
+import { sanitizePathSegment } from "../graph.js";
+import type { Config } from "../config.js";
 import { ok, fail, type ToolResult } from "./util.js";
 
 const attendee = (addr: string) => ({
@@ -30,6 +32,7 @@ const EVENT_SELECT =
 export function registerCalendarTools(
   server: McpServer,
   graph: GraphClient,
+  config: Config,
 ): void {
   server.registerTool(
     "list_events",
@@ -87,7 +90,7 @@ export function registerCalendarTools(
     async ({ id, timeZone }): Promise<ToolResult> => {
       try {
         const e = await graph.request<any>({
-          path: `/me/events/${id}`,
+          path: `/me/events/${sanitizePathSegment(id, "event id")}`,
           headers: { Prefer: `outlook.timezone="${timeZone}"` },
         });
         return ok({
@@ -106,11 +109,13 @@ export function registerCalendarTools(
     },
   );
 
+  // create_event with attendees is gated behind OUTLOOK_ALLOW_WRITES (counts as sending).
+  // Creating events without attendees is always allowed.
   server.registerTool(
     "create_event",
     {
       title: "Create calendar event",
-      description: "Create a new calendar event / meeting.",
+      description: "Create a new calendar event / meeting. Creating events with attendees requires OUTLOOK_ALLOW_WRITES=true.",
       inputSchema: {
         subject: z.string(),
         start: z.string().describe("ISO 8601 start datetime."),
@@ -121,7 +126,7 @@ export function registerCalendarTools(
         attendees: z
           .array(z.string())
           .optional()
-          .describe("Attendee email addresses."),
+          .describe("Attendee email addresses (requires OUTLOOK_ALLOW_WRITES=true)."),
         isOnlineMeeting: z
           .boolean()
           .default(false)
@@ -139,6 +144,13 @@ export function registerCalendarTools(
       isOnlineMeeting,
     }): Promise<ToolResult> => {
       try {
+        if (attendees?.length && !config.allowWrites) {
+          return fail(
+            "Creating events with attendees (sending meeting invites) requires " +
+            "OUTLOOK_ALLOW_WRITES=true. Set this environment variable to enable, or " +
+            "create the event without attendees.",
+          );
+        }
         const payload: Record<string, unknown> = {
           subject,
           start: { dateTime: start, timeZone },
@@ -191,7 +203,7 @@ export function registerCalendarTools(
         }
         const e = await graph.request<any>({
           method: "PATCH",
-          path: `/me/events/${id}`,
+          path: `/me/events/${sanitizePathSegment(id, "event id")}`,
           body: payload,
         });
         return ok(summarizeEvent(e));
@@ -201,22 +213,25 @@ export function registerCalendarTools(
     },
   );
 
-  server.registerTool(
-    "delete_event",
-    {
-      title: "Delete calendar event",
-      description: "Delete/cancel an event by id.",
-      inputSchema: { id: z.string() },
-    },
-    async ({ id }): Promise<ToolResult> => {
-      try {
-        await graph.request({ method: "DELETE", path: `/me/events/${id}` });
-        return ok({ deleted: true, id });
-      } catch (err) {
-        return fail(err);
-      }
-    },
-  );
+  // delete_event is gated behind OUTLOOK_ALLOW_WRITES.
+  if (config.allowWrites) {
+    server.registerTool(
+      "delete_event",
+      {
+        title: "Delete calendar event",
+        description: "Delete/cancel an event by id. (Write-gated: requires OUTLOOK_ALLOW_WRITES=true)",
+        inputSchema: { id: z.string() },
+      },
+      async ({ id }): Promise<ToolResult> => {
+        try {
+          await graph.request({ method: "DELETE", path: `/me/events/${sanitizePathSegment(id, "event id")}` });
+          return ok({ deleted: true, id });
+        } catch (err) {
+          return fail(err);
+        }
+      },
+    );
+  }
 
   server.registerTool(
     "respond_to_event",
@@ -234,7 +249,7 @@ export function registerCalendarTools(
       try {
         await graph.request({
           method: "POST",
-          path: `/me/events/${id}/${response}`,
+          path: `/me/events/${sanitizePathSegment(id, "event id")}/${response}`,
           body: { comment: comment ?? "", sendResponse },
         });
         return ok({ responded: true, id, response });

@@ -44,7 +44,26 @@ export interface Config {
   tenantId: string;
   scopes: string[];
   tokenCachePath: string;
+  expectedUsername?: string;
+  allowWrites: boolean;
 }
+
+/**
+ * Hard-coded allowlist of Graph scopes for a hardened work-tenant fork.
+ * MSAL may add offline_access automatically.
+ */
+const ALLOWED_SCOPES = new Set([
+  "User.Read",
+  "Mail.ReadWrite",
+  "Mail.Send",
+  "Calendars.ReadWrite",
+  "Contacts.ReadWrite",
+  "MailboxSettings.ReadWrite",
+  "offline_access",
+]);
+
+const DEFAULT_SCOPES =
+  "User.Read Mail.ReadWrite Mail.Send Calendars.ReadWrite Contacts.ReadWrite MailboxSettings.ReadWrite";
 
 export function loadConfig(): Config {
   const clientId = process.env.OUTLOOK_CLIENT_ID?.trim();
@@ -55,18 +74,54 @@ export function loadConfig(): Config {
     );
   }
 
-  const tenantId = process.env.OUTLOOK_TENANT_ID?.trim() || "common";
+  const tenantId = process.env.OUTLOOK_TENANT_ID?.trim();
+  if (!tenantId) {
+    throw new Error(
+      "OUTLOOK_TENANT_ID is required. This hardened fork does not accept the default 'common' tenant. " +
+        "Set OUTLOOK_TENANT_ID to your organization's tenant GUID in .env.",
+    );
+  }
 
-  const scopes = (
-    process.env.OUTLOOK_SCOPES?.trim() ||
-    "User.Read Mail.ReadWrite Mail.Send Calendars.ReadWrite Contacts.ReadWrite MailboxSettings.ReadWrite"
-  )
-    .split(/\s+/)
-    .filter(Boolean);
+  // Reject well-known tenant identifiers that allow any account type.
+  const forbidden = ["common", "organizations", "consumers"];
+  if (forbidden.includes(tenantId.toLowerCase())) {
+    throw new Error(
+      `OUTLOOK_TENANT_ID="${tenantId}" is not allowed in this hardened work-tenant fork. ` +
+        `Use your organization's tenant GUID (e.g. a UUID like 12345678-1234-1234-1234-123456789abc).`,
+    );
+  }
+
+  // Basic validation that it looks like a GUID.
+  const guidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  if (!guidRegex.test(tenantId)) {
+    throw new Error(
+      `OUTLOOK_TENANT_ID="${tenantId}" does not look like a valid tenant GUID. ` +
+        `Expected format: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`,
+    );
+  }
+
+  const scopesString = process.env.OUTLOOK_SCOPES?.trim() || DEFAULT_SCOPES;
+  const scopes = scopesString.split(/\s+/).filter(Boolean);
+
+  // Validate scopes against allowlist.
+  for (const scope of scopes) {
+    if (!ALLOWED_SCOPES.has(scope)) {
+      throw new Error(
+        `Scope "${scope}" is not allowed in this hardened fork. ` +
+          `Allowed scopes: ${Array.from(ALLOWED_SCOPES).filter((s) => s !== "offline_access").join(", ")}. ` +
+          `Remove or replace disallowed scopes in OUTLOOK_SCOPES.`,
+      );
+    }
+  }
 
   const tokenCachePath =
     process.env.OUTLOOK_TOKEN_CACHE_PATH?.trim() ||
     join(projectRoot(), ".token-cache.json");
 
-  return { clientId, tenantId, scopes, tokenCachePath };
+  const expectedUsername = process.env.OUTLOOK_EXPECTED_USERNAME?.trim();
+
+  const allowWrites =
+    process.env.OUTLOOK_ALLOW_WRITES?.trim().toLowerCase() === "true";
+
+  return { clientId, tenantId, scopes, tokenCachePath, expectedUsername, allowWrites };
 }
