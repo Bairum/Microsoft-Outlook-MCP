@@ -60,6 +60,8 @@ async function main(): Promise<void> {
         signedIn,
         scopes: config.scopes,
         tenant: config.tenantId,
+        expectedUsername: config.expectedUsername || "(any cached account)",
+        allowWrites: config.allowWrites,
         hint: signedIn
           ? "Session cached. Tools should work."
           : "Not signed in. Run `npm run login` in a terminal, then retry.",
@@ -67,10 +69,10 @@ async function main(): Promise<void> {
     },
   );
 
-  registerMailTools(server, graph);
-  registerCalendarTools(server, graph);
-  registerContactTools(server, graph);
-  registerRulesAndFolderTools(server, graph);
+  registerMailTools(server, graph, config);
+  registerCalendarTools(server, graph, config);
+  registerContactTools(server, graph, config);
+  registerRulesAndFolderTools(server, graph, config);
 
   const transport = new StdioServerTransport();
   await server.connect(transport);
