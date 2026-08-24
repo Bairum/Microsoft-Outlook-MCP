@@ -1,5 +1,5 @@
-import { PersistenceCreator, PersistenceCachePlugin, DataProtectionScope } from "@azure/msal-node-extensions";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { PersistenceCreator, DataProtectionScope } from "@azure/msal-node-extensions";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
