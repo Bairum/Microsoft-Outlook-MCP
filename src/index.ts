@@ -2,19 +2,29 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
+import { join } from "node:path";
 import { loadConfig } from "./config.js";
 import { AuthProvider } from "./auth.js";
 import { GraphClient } from "./graph.js";
+import { DeltaStore } from "./deltaStore.js";
 import { registerMailTools } from "./tools/mail.js";
 import { registerCalendarTools } from "./tools/calendar.js";
 import { registerContactTools } from "./tools/contacts.js";
 import { registerRulesAndFolderTools } from "./tools/rules.js";
+import { registerDeltaTools } from "./tools/delta.js";
 import { ok, fail, type ToolResult } from "./tools/util.js";
 
 async function main(): Promise<void> {
   const config = loadConfig();
   const auth = await AuthProvider.create(config);
   const graph = new GraphClient(auth);
+  
+  // Create delta store for persisting Graph API delta cursors.
+  const deltaCachePath = join(
+    config.tokenCachePath.replace(".token-cache.json", ""),
+    ".delta-cursors.json"
+  );
+  const deltaStore = await DeltaStore.create(deltaCachePath);
 
   const server = new McpServer({
     name: "microsoft-outlook-mcp",
@@ -73,6 +83,7 @@ async function main(): Promise<void> {
   registerCalendarTools(server, graph, config);
   registerContactTools(server, graph, config);
   registerRulesAndFolderTools(server, graph, config);
+  registerDeltaTools(server, graph, config, deltaStore);
 
   const transport = new StdioServerTransport();
   await server.connect(transport);
