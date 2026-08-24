@@ -307,6 +307,248 @@ export function registerMailTools(server: McpServer, graph: GraphClient, config:
   );
 
   server.registerTool(
+    "create_draft",
+    {
+      title: "Create draft",
+      description:
+        "Create a new draft message without sending. The draft is saved in the " +
+        "Drafts folder and can be edited, sent later, or discarded. Does not " +
+        "require OUTLOOK_ALLOW_WRITES.",
+      inputSchema: {
+        subject: z.string().optional(),
+        body: z.string().optional(),
+        bodyType: z.enum(["text", "html"]).default("text"),
+        to: z
+          .array(z.string())
+          .optional()
+          .describe("Recipient email addresses."),
+        cc: z.array(z.string()).optional(),
+        bcc: z.array(z.string()).optional(),
+      },
+    },
+    async ({ subject, body, bodyType, to, cc, bcc }): Promise<ToolResult> => {
+      try {
+        const message: Record<string, unknown> = {};
+        if (subject !== undefined) message.subject = subject;
+        if (body !== undefined) {
+          message.body = { contentType: bodyType, content: body };
+        }
+        if (to && to.length > 0) {
+          message.toRecipients = to.map(recipient);
+        }
+        if (cc && cc.length > 0) {
+          message.ccRecipients = cc.map(recipient);
+        }
+        if (bcc && bcc.length > 0) {
+          message.bccRecipients = bcc.map(recipient);
+        }
+
+        const draft = await graph.request<any>({
+          method: "POST",
+          path: "/me/messages",
+          body: message,
+        });
+
+        return ok({
+          id: draft.id,
+          subject: draft.subject,
+          isDraft: draft.isDraft,
+          webLink: draft.webLink,
+        });
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  server.registerTool(
+    "create_reply_draft",
+    {
+      title: "Create reply draft",
+      description:
+        "Create a reply draft for an existing message without sending. The draft " +
+        "is created as a reply to the original sender only. Does not require " +
+        "OUTLOOK_ALLOW_WRITES.",
+      inputSchema: {
+        id: z.string().describe("The message id to reply to."),
+        comment: z
+          .string()
+          .optional()
+          .describe("Optional reply text to include in the draft body."),
+      },
+    },
+    async ({ id, comment }): Promise<ToolResult> => {
+      try {
+        const body: Record<string, unknown> = {};
+        if (comment !== undefined) body.comment = comment;
+
+        const draft = await graph.request<any>({
+          method: "POST",
+          path: `/me/messages/${sanitizePathSegment(id, "message id")}/createReply`,
+          body: Object.keys(body).length > 0 ? body : undefined,
+        });
+
+        return ok({
+          id: draft.id,
+          subject: draft.subject,
+          isDraft: draft.isDraft,
+          inReplyTo: id,
+          webLink: draft.webLink,
+        });
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  server.registerTool(
+    "create_reply_all_draft",
+    {
+      title: "Create reply-all draft",
+      description:
+        "Create a reply-all draft for an existing message without sending. The " +
+        "draft is created as a reply to all recipients of the original message. " +
+        "Does not require OUTLOOK_ALLOW_WRITES.",
+      inputSchema: {
+        id: z.string().describe("The message id to reply to."),
+        comment: z
+          .string()
+          .optional()
+          .describe("Optional reply text to include in the draft body."),
+      },
+    },
+    async ({ id, comment }): Promise<ToolResult> => {
+      try {
+        const body: Record<string, unknown> = {};
+        if (comment !== undefined) body.comment = comment;
+
+        const draft = await graph.request<any>({
+          method: "POST",
+          path: `/me/messages/${sanitizePathSegment(id, "message id")}/createReplyAll`,
+          body: Object.keys(body).length > 0 ? body : undefined,
+        });
+
+        return ok({
+          id: draft.id,
+          subject: draft.subject,
+          isDraft: draft.isDraft,
+          inReplyTo: id,
+          replyAll: true,
+          webLink: draft.webLink,
+        });
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  server.registerTool(
+    "create_forward_draft",
+    {
+      title: "Create forward draft",
+      description:
+        "Create a forward draft for an existing message without sending. Does not " +
+        "require OUTLOOK_ALLOW_WRITES.",
+      inputSchema: {
+        id: z.string().describe("The message id to forward."),
+        comment: z
+          .string()
+          .optional()
+          .describe("Optional text to include in the draft body."),
+        to: z
+          .array(z.string())
+          .optional()
+          .describe("Recipient email addresses for the forward."),
+      },
+    },
+    async ({ id, comment, to }): Promise<ToolResult> => {
+      try {
+        const body: Record<string, unknown> = {};
+        if (comment !== undefined) body.comment = comment;
+        if (to && to.length > 0) {
+          body.toRecipients = to.map(recipient);
+        }
+
+        const draft = await graph.request<any>({
+          method: "POST",
+          path: `/me/messages/${sanitizePathSegment(id, "message id")}/createForward`,
+          body: Object.keys(body).length > 0 ? body : undefined,
+        });
+
+        return ok({
+          id: draft.id,
+          subject: draft.subject,
+          isDraft: draft.isDraft,
+          forwarding: id,
+          webLink: draft.webLink,
+        });
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  server.registerTool(
+    "update_draft",
+    {
+      title: "Update draft",
+      description:
+        "Update an existing draft message. Can update subject, body, and " +
+        "recipients. Only works on draft messages (not sent messages). Does not " +
+        "require OUTLOOK_ALLOW_WRITES.",
+      inputSchema: {
+        id: z.string().describe("The draft message id to update."),
+        subject: z.string().optional(),
+        body: z.string().optional(),
+        bodyType: z
+          .enum(["text", "html"])
+          .default("text")
+          .describe("Content type for the body field."),
+        to: z.array(z.string()).optional(),
+        cc: z.array(z.string()).optional(),
+        bcc: z.array(z.string()).optional(),
+      },
+    },
+    async ({ id, subject, body, bodyType, to, cc, bcc }): Promise<ToolResult> => {
+      try {
+        const update: Record<string, unknown> = {};
+        if (subject !== undefined) update.subject = subject;
+        if (body !== undefined) {
+          update.body = { contentType: bodyType, content: body };
+        }
+        if (to !== undefined) {
+          update.toRecipients = to.map(recipient);
+        }
+        if (cc !== undefined) {
+          update.ccRecipients = cc.map(recipient);
+        }
+        if (bcc !== undefined) {
+          update.bccRecipients = bcc.map(recipient);
+        }
+
+        if (Object.keys(update).length === 0) {
+          return fail("Provide at least one field to update.");
+        }
+
+        const draft = await graph.request<any>({
+          method: "PATCH",
+          path: `/me/messages/${sanitizePathSegment(id, "message id")}`,
+          body: update,
+        });
+
+        return ok({
+          id: draft.id,
+          subject: draft.subject,
+          isDraft: draft.isDraft,
+          webLink: draft.webLink,
+        });
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  server.registerTool(
     "list_mail_folders",
     {
       title: "List mail folders",

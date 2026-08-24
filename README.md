@@ -212,6 +212,12 @@ By default, `OUTLOOK_ALLOW_WRITES=false`. In this mode:
 | `delete_message` (permanent) | ❌ Requires `OUTLOOK_ALLOW_WRITES=true` |
 | `send_mail` | ❌ Not registered |
 | `reply_to_message` | ❌ Not registered |
+| **Mail (drafts)** | |
+| `create_draft` | ✅ Available (creates draft without sending) |
+| `create_reply_draft` | ✅ Available (creates reply draft without sending) |
+| `create_reply_all_draft` | ✅ Available (creates reply-all draft without sending) |
+| `create_forward_draft` | ✅ Available (creates forward draft without sending) |
+| `update_draft` | ✅ Available (updates draft message) |
 | **Calendar** | |
 | `list_events`, `get_event` | ✅ Available |
 | `create_event` (no attendees) | ✅ Available |
