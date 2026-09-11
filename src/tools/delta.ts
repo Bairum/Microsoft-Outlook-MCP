@@ -1,7 +1,7 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { GraphClient } from "../graph.js";
-import { sanitizePathSegment } from "../graph.js";
+import { GraphError, sanitizePathSegment } from "../graph.js";
 import type { Config } from "../config.js";
 import type { DeltaStore } from "../deltaStore.js";
 import { ok, fail, type ToolResult } from "./util.js";
@@ -23,7 +23,7 @@ interface CompactMessage {
 /**
  * Compact event summary for delta/snapshot results.
  */
-interface CompactEvent {
+export interface CompactEvent {
   id: string;
   subject?: string;
   organizer?: string;
@@ -31,6 +31,24 @@ interface CompactEvent {
   isAllDay?: boolean;
   attendeeCount?: number;
   hasNoAttendees?: boolean;
+  isCancelled?: boolean;
+}
+
+/**
+ * True when Graph marks the event cancelled, or Outlook prefixes the subject
+ * with Canceled/Cancelled (common after a series instance is cancelled).
+ */
+export function isCancelledEvent(e: {
+  isCancelled?: boolean;
+  subject?: string;
+}): boolean {
+  if (e.isCancelled === true) return true;
+  const subject = (e.subject ?? "").trim();
+  return /^cancell?ed(\s|:)/i.test(subject);
+}
+
+function attendeeList(e: { attendees?: unknown }): unknown[] {
+  return Array.isArray(e.attendees) ? e.attendees : [];
 }
 
 /**
@@ -51,9 +69,20 @@ function summarizeMessage(m: any): CompactMessage {
 
 /**
  * Summarize a Graph event into a compact format, flagging no-attendee events.
+ *
+ * `hasNoAttendees` is a candidate flag only: calendar delta (and occasionally
+ * calendarView) can omit or empty `attendees` on series instances even when
+ * invitees exist. Callers must run {@link verifyZeroAttendeeEvents} before
+ * returning results so the flag means "Graph Required list is empty after a
+ * full read", not "this payload happened to lack attendees".
+ *
+ * Cancelled and deleted (`@removed`) events are never flagged as actionable
+ * empty holds.
  */
-function summarizeEvent(e: any): CompactEvent {
-  const attendees = e.attendees ?? [];
+export function summarizeEvent(e: any): CompactEvent {
+  const attendees = attendeeList(e);
+  const cancelled = isCancelledEvent(e);
+  const removed = Boolean(e["@removed"]);
   return {
     id: e.id,
     subject: e.subject,
@@ -61,8 +90,55 @@ function summarizeEvent(e: any): CompactEvent {
     start: e.start?.dateTime,
     isAllDay: e.isAllDay,
     attendeeCount: attendees.length,
-    hasNoAttendees: attendees.length === 0,
+    ...(cancelled ? { isCancelled: true } : {}),
+    // Only empty, non-cancelled, non-deleted events are candidates.
+    hasNoAttendees: !cancelled && !removed && attendees.length === 0,
   };
+}
+
+/**
+ * Re-read only events that look like zero-attendee holds.
+ *
+ * Graph calendar delta often strips `attendees` from series instances. A
+ * single `GET /me/events/{id}` corrects false positives. Verified empty
+ * (or a missing event) keeps `hasNoAttendees: true`. Pending RSVP
+ * (`notResponded`) is still an attendee and will clear the flag.
+ */
+export async function verifyZeroAttendeeEvents(
+  graph: GraphClient,
+  events: CompactEvent[]
+): Promise<void> {
+  for (const event of events) {
+    if (!event.hasNoAttendees || event.isCancelled || !event.id) continue;
+
+    try {
+      const verified = await graph.request<{
+        attendees?: unknown;
+        isCancelled?: boolean;
+      }>({
+        path: `/me/events/${sanitizePathSegment(event.id, "event id")}`,
+        query: { $select: "id,attendees,isCancelled" },
+      });
+
+      if (verified.isCancelled || isCancelledEvent(verified)) {
+        event.isCancelled = true;
+        event.hasNoAttendees = false;
+        const count = attendeeList(verified).length;
+        event.attendeeCount = count;
+        continue;
+      }
+
+      const count = attendeeList(verified).length;
+      event.attendeeCount = count;
+      event.hasNoAttendees = count === 0;
+    } catch (err) {
+      // Missing/gone event: treat as still empty (keep the candidate flag).
+      if (err instanceof GraphError && (err.status === 404 || err.status === 410)) {
+        continue;
+      }
+      throw err;
+    }
+  }
 }
 
 /**
@@ -148,7 +224,7 @@ async function fetchCalendarDelta(
     : {
         startDateTime: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString(),
         endDateTime: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString(),
-        $select: "id,subject,organizer,start,isAllDay,attendees",
+        $select: "id,subject,organizer,start,isAllDay,attendees,isCancelled",
       };
 
   // GraphClient.request now handles absolute URLs (deltaLink) and validates origin.
@@ -171,6 +247,9 @@ async function fetchCalendarDelta(
   if (!page["@odata.deltaLink"]) {
     throw new Error("No @odata.deltaLink returned from calendar delta endpoint");
   }
+
+  // Delta often omits attendees on series instances — verify only empty candidates.
+  await verifyZeroAttendeeEvents(graph, events);
 
   return { events, nextDeltaLink: page["@odata.deltaLink"] };
 }
@@ -390,14 +469,16 @@ export function registerDeltaTools(
           query: {
             startDateTime: todayStart,
             endDateTime: tomorrowEnd,
-            $select: "id,subject,organizer,start,isAllDay,attendees",
+            $select: "id,subject,organizer,start,isAllDay,attendees,isCancelled",
             $orderby: "start/dateTime",
             $top: 100,
           },
           headers: { Prefer: `outlook.timezone="${timezone}"` },
         });
 
-        result.calendarTodayTomorrow = calendarData.value.map(summarizeEvent);
+        const calendarEvents = calendarData.value.map(summarizeEvent);
+        await verifyZeroAttendeeEvents(graph, calendarEvents);
+        result.calendarTodayTomorrow = calendarEvents;
 
         return ok(result);
       } catch (e) {

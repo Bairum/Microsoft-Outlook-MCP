@@ -271,9 +271,22 @@ Returns a point-in-time snapshot of recent activity in one call:
   document `America/New_York` as an example)
 - Zero-attendee calendar events are flagged with `hasNoAttendees: true`
 
-Payloads are compact. Does not download full bodies, send mail, move messages,
-or modify events. Use this for quick health checks or when you need a fresh
-operational view without iterating.
+`hasNoAttendees: true` means Microsoft Graph's `attendees[]` — the Required /
+Optional invitee list — is empty **after a full event read**. It does **not**
+mean the event body has no `@mentions` (body mentions are not attendees), and
+it does **not** mean invitees have a pending RSVP (`notResponded`). A pending
+RSVP is still an attendee.
+
+`list_changes` calendar **delta** sometimes omits or empties `attendees` on
+series instances even when invitees exist. Both `list_changes` and
+`get_ops_snapshot` now verify only those zero-attendee *candidates* with
+`GET /me/events/{id}?$select=id,attendees,isCancelled` before returning the
+flag. If the full read finds attendees, `hasNoAttendees` is set to `false` and
+`attendeeCount` is corrected. A real empty hold (organizer saved a Teams slot
+with no Required invitees) still flags.
+
+Cancelled events (`isCancelled` or a `Canceled:` / `Cancelled:` subject prefix)
+and deleted delta items (`@removed`) are not flagged as actionable empty holds.
 
 **Security**: Delta cursors (the `@odata.deltaLink` URLs returned by Graph) are
 validated to ensure they point to `https://graph.microsoft.com` before being
