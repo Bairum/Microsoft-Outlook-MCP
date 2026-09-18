@@ -12,7 +12,8 @@
     "start": "node dist/index.js",
     "dev": "tsc --watch",
     "login": "node dist/login.js",
-    "test": "node dist/graph.test.js && node dist/deltaStore.test.js && node dist/tools/delta.test.js && node dist/config.test.js && node dist/auth.test.js",
+    "test": "node dist/graph.test.js && node dist/tools/delta.test.js && node dist/config.test.js && node dist/auth.test.js",
+    "test:delta-store": "node dist/deltaStore.test.js",
     "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\""
   },
   "engines": {
