@@ -120,9 +120,10 @@ Restart the client. Ask Claude to run `auth_status` or `whoami` to confirm.
 - The token cache is stored in **OS-native encrypted storage** via
   [`@azure/msal-node-extensions`](https://www.npmjs.com/package/@azure/msal-node-extensions):
   DPAPI on Windows, Keychain on macOS, libsecret on Linux. The backend is
-  verified at startup; if the native layer can't be loaded, the server logs a
-  warning and falls back to a restricted-permission plaintext file so sign-in
-  still works.
+  verified at startup with a **separate** libsecret service/account from the
+  live cache. If the native layer can't be loaded, this fork **refuses to
+  start** (no plaintext fallback). After device-code login the cache is
+  force-persisted and round-trip checked.
 - All diagnostics go to **stderr**; **stdout** carries only the MCP JSON-RPC
   stream.
 
@@ -337,11 +338,43 @@ restricted-permission plaintext file. To get encryption working:
   then `npm rebuild`.
 - **Linux** — install `build-essential`, `python3`, and libsecret headers
   (Debian/Ubuntu: `sudo apt-get install build-essential python3 libsecret-1-dev`);
-  ensure a Secret Service provider (e.g. GNOME Keyring) is running, then
-  `npm rebuild`.
+  ensure a Secret Service provider (e.g. GNOME Keyring) is running **and
+  unlocked**, then `npm rebuild`. This fork fails closed if the keyring is
+  unavailable — there is no plaintext fallback.
 
 After rebuilding, run `npm run login -- --status` and confirm the log reports
 OS-native encrypted storage.
+
+### Linux: token does not stick after `npm run login`
+
+On Linux, libsecret (Secret Service) keys entries by **service name + account
+name**, not by `cachePath`. A startup `verifyPersistence` probe that reused
+the live pair (`microsoft-outlook-mcp` / `token-cache`) could overwrite the
+real token with dummy verify data. The probe now uses a separate pair
+(`microsoft-outlook-mcp-verify` / `verify-probe`).
+
+After a successful device-code login the server also **force-persists** the
+in-memory MSAL cache (`serialize()` + `persistence.save()`) and fails if the
+round-trip reload is empty or tiny. `PersistenceCachePlugin` sometimes skips
+that write even when accounts exist in memory.
+
+If login succeeds but the next process still says "Not signed in":
+
+1. Confirm a Secret Service provider is running and **unlocked** (GNOME
+   Keyring, KWallet, or `gnome-keyring-daemon`). A locked keyring accepts
+   writes that vanish on the next process.
+2. Headless / SSH sessions need a D-Bus session. You can put
+   `export KEY='value'` lines in `.keyring-env` (git-ignored) in the project
+   root, for example:
+
+   ```
+   export DBUS_SESSION_BUS_ADDRESS='unix:path=/run/user/1000/bus'
+   ```
+
+   `npm run login` and the MCP server load this file automatically. Do not
+   commit `.keyring-env`.
+3. Re-run `npm run login` and confirm stderr reports the token cache was
+   force-persisted.
 
 ### `AADSTS7000218` or "public client flow" errors during login
 
