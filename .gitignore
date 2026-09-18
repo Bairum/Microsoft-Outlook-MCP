@@ -5,3 +5,11 @@ dist/
 # Secrets and local auth state
 .env
 .token-cache.json
+.token-cache.json.lockfile
+.keyring-env
+
+# Local cursor / delta caches
+.delta-cursors.json
+.delta-cursors.json.lockfile
+*.delta-cursors.json
+*.token-cache.json

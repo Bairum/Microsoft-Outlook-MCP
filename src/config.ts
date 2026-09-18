@@ -3,36 +3,66 @@ import { dirname, join } from "node:path";
 import { existsSync, readFileSync } from "node:fs";
 
 /**
- * Minimal .env loader (no dependency). Reads KEY=VALUE lines from a .env file
- * in the project root and populates process.env for any keys not already set.
+ * Parse one `.env` / `.keyring-env` assignment. Accepts `KEY=value`,
+ * `export KEY='value'`, and double-quoted values. Comments and blank lines
+ * return null.
  */
-function loadDotEnv(): void {
+export function parseEnvAssignment(
+  rawLine: string,
+): { key: string; value: string } | null {
+  const line = rawLine.trim();
+  if (!line || line.startsWith("#")) return null;
+  const assignment = line.startsWith("export ") ? line.slice(7).trim() : line;
+  const eq = assignment.indexOf("=");
+  if (eq === -1) return null;
+  const key = assignment.slice(0, eq).trim();
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) return null;
+  let value = assignment.slice(eq + 1).trim();
+  if (
+    (value.startsWith('"') && value.endsWith('"')) ||
+    (value.startsWith("'") && value.endsWith("'"))
+  ) {
+    value = value.slice(1, -1);
+  }
+  return { key, value };
+}
+
+function applyEnvFile(fileName: string): void {
   const here = dirname(fileURLToPath(import.meta.url));
   // dist/config.js -> project root is one level up from dist
   const root = join(here, "..");
-  const envPath = join(root, ".env");
+  const envPath = join(root, fileName);
   if (!existsSync(envPath)) return;
 
   const text = readFileSync(envPath, "utf8");
   for (const rawLine of text.split(/\r?\n/)) {
-    const line = rawLine.trim();
-    if (!line || line.startsWith("#")) continue;
-    const eq = line.indexOf("=");
-    if (eq === -1) continue;
-    const key = line.slice(0, eq).trim();
-    let value = line.slice(eq + 1).trim();
-    // Strip surrounding quotes if present.
-    if (
-      (value.startsWith('"') && value.endsWith('"')) ||
-      (value.startsWith("'") && value.endsWith("'"))
-    ) {
-      value = value.slice(1, -1);
+    const parsed = parseEnvAssignment(rawLine);
+    if (!parsed) continue;
+    if (process.env[parsed.key] === undefined) {
+      process.env[parsed.key] = parsed.value;
     }
-    if (process.env[key] === undefined) process.env[key] = value;
   }
 }
 
+/**
+ * Minimal .env loader (no dependency). Reads KEY=VALUE lines from a .env file
+ * in the project root and populates process.env for any keys not already set.
+ */
+function loadDotEnv(): void {
+  applyEnvFile(".env");
+}
+
+/**
+ * Headless Linux sessions often need D-Bus / keyring variables that a desktop
+ * session would have exported already. `.keyring-env` accepts `export KEY='value'`
+ * lines (git-ignored). Existing process.env keys are not overwritten.
+ */
+function loadKeyringEnv(): void {
+  applyEnvFile(".keyring-env");
+}
+
 loadDotEnv();
+loadKeyringEnv();
 
 function projectRoot(): string {
   const here = dirname(fileURLToPath(import.meta.url));

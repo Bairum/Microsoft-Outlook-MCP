@@ -30,11 +30,13 @@ export class DeltaStore {
     const testCachePath = join(testDir, "test-verify.cache");
 
     try {
+      // Verify probe uses a different libsecret service/account than the live
+      // store. On Linux, Secret Service keys by service+account, not cachePath.
       const testPersistence = await PersistenceCreator.createPersistence({
         cachePath: testCachePath,
         dataProtectionScope: DataProtectionScope.CurrentUser,
-        serviceName: "microsoft-outlook-mcp",
-        accountName: "delta-cursors",
+        serviceName: "microsoft-outlook-mcp-verify",
+        accountName: "delta-verify-probe",
         usePlaintextFileOnLinux: false,
       });
 
